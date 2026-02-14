@@ -1,0 +1,10 @@
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-huggingface
+chromadb
+sentence-transformers
+python-dotenv
+rank_bm25
+tiktoken
