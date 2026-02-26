@@ -47,10 +47,10 @@ retriever = uploader.get_retriever(retriever_type="hybrid", weights=(0.5, 0.5))
 
 # ----------------------------
 # LLM — task specifies nvidia/nemotron-3-nano-30b-a3b:free via OpenRouter
-# Model hardcoded as task only guarantees OPENROUTER_API_KEY and HF_API_KEY
+# LLM_MODEL_NAME is optional — defaults to nemotron if not set in .env
 # ----------------------------
 llm = ChatOpenAI(
-    model="nvidia/nemotron-3-nano-30b-a3b:free",
+    model=os.getenv("LLM_MODEL_NAME", "nvidia/nemotron-3-nano-30b-a3b:free"),
     openai_api_key=OPENROUTER_API_KEY,
     openai_api_base="https://openrouter.ai/api/v1",
     temperature=0,
