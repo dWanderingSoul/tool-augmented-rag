@@ -1,12 +1,13 @@
 langchain
 langchain-core
+langchain-classic
 langchain-community
 langchain-openai
 langchain-huggingface
+langchain-text-splitters
 chromadb
 sentence-transformers
 python-dotenv
 rank_bm25
 tiktoken
 huggingface-hub
-faiss-cpu
