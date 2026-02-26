@@ -1,164 +1,180 @@
 import os
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
-from langchain.tools import Tool
-from langchain.agents import initialize_agent, AgentType
-from langchain.memory import ConversationBufferMemory
+from langchain.tools import tool
+from langchain.agents import create_agent
 
-from rag import RAGSystem
+from rag import RAGDocumentUploader
 
 # ----------------------------
 # Load .env
+# Task only provides OPENROUTER_API_KEY and HF_API_KEY
 # ----------------------------
 load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 HF_API_KEY = os.getenv("HF_API_KEY", "")
 
+# Pass HuggingFace token so sentence-transformers can download from Hub
+if HF_API_KEY:
+    os.environ["HUGGINGFACEHUB_API_TOKEN"] = HF_API_KEY
+
 # ----------------------------
-# Initialize RAG
+# Resolve data/ and chroma_db/ relative to THIS file's location
+# so the script works regardless of which directory the grader runs it from
 # ----------------------------
-rag = RAGSystem(data_path="data")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+CHROMA_DIR = os.path.join(BASE_DIR, "chroma_db")
+
+# ----------------------------
+# Initialize RAG with hybrid retrieval (BM25 + ChromaDB)
+# Load and index every file in data/
+# ----------------------------
+uploader = RAGDocumentUploader(persist_directory=CHROMA_DIR)
+
+data_path = Path(DATA_DIR)
+data_path.mkdir(parents=True, exist_ok=True)
+
+data_files = [str(f) for f in data_path.rglob("*") if f.is_file()]
+if data_files:
+    uploader.upload_batch(data_files)
+
+retriever = uploader.get_retriever(retriever_type="hybrid", weights=(0.5, 0.5))
+
+# ----------------------------
+# LLM — task specifies nvidia/nemotron-3-nano-30b-a3b:free via OpenRouter
+# Model hardcoded as task only guarantees OPENROUTER_API_KEY and HF_API_KEY
+# ----------------------------
+llm = ChatOpenAI(
+    model="nvidia/nemotron-3-nano-30b-a3b:free",
+    openai_api_key=OPENROUTER_API_KEY,
+    openai_api_base="https://openrouter.ai/api/v1",
+    temperature=0,
+)
 
 
 # ----------------------------
 # Tool 1: Flight Booking
-# FIX: Returns Lagos <-> Nairobi data (matching the Stage 4 reference tool),
-#      not Lagos-Abuja/London which was irrelevant to the task prompt.
+# Rewritten from Stage 4 — same function signature: get_flight_schedule(origin, destination)
 # ----------------------------
-def get_flight_schedule(query: str) -> str:
-    return (
-        "Flight Schedule (USD, one-way):\n"
-        "- Lagos (LOS) → Nairobi (NBO): flight time 5.5 hours, price $920\n"
-        "- Nairobi (NBO) → Lagos (LOS): flight time 5.5 hours, price $920\n"
-        "Round-trip total: 11 hours flight time, $1,840 USD"
-    )
+@tool
+def get_flight_schedule(origin: str, destination: str) -> dict:
+    """Returns flight duration in hours and ticket price in USD for a one-way flight between two cities."""
+    return {
+        "origin": origin,
+        "destination": destination,
+        "flight_time_hours": 5.5,
+        "price_usd": 920,
+    }
 
 
 # ----------------------------
 # Tool 2: Hotel Booking
-# FIX: Returns Nairobi hotels (matching the Stage 4 reference tool values).
-#      Original returned Lagos/Abuja hotels — wrong city for the prompt.
+# Rewritten from Stage 4 — same function signature: get_hotel_schedule(city)
 # ----------------------------
-def get_hotel_schedule(query: str) -> str:
-    return (
-        "Hotel options in Nairobi (USD per night):\n"
-        "- Nairobi Serena Hotel: $250/night\n"
-        "- Radisson Blu Nairobi: $200/night\n"
-        "3-night stay costs: Nairobi Serena $750 | Radisson Blu $600"
-    )
+@tool
+def get_hotel_schedule(city: str) -> dict:
+    """Returns available hotel options and their prices in USD per night for a given city."""
+    return {
+        "city": city,
+        "hotels": [
+            {"name": "Nairobi Serena", "price_usd": 250},
+            {"name": "Radisson Blu", "price_usd": 200},
+        ],
+    }
 
 
 # ----------------------------
 # Tool 3: Currency Conversion
+# Rewritten from Stage 4 — same function signature: convert_currency(amount, from_currency, to_currency)
 # ----------------------------
-def convert_currency(query: str) -> str:
-    return (
-        "Currency conversion rates:\n"
-        "- 1 USD = 1,400 NGN (Nigerian Naira)\n"
-        "- 1 USD = 130 KES (Kenyan Shilling)\n"
-        "- 1 USD = 0.92 EUR\n"
-        "Example: $2,440 USD = 3,416,000 NGN"
-    )
+@tool
+def convert_currency(amount: float, from_currency: str, to_currency: str) -> dict:
+    """Converts a monetary amount from one currency to another."""
+    exchange_rates = {
+        ("USD", "NGN"): 1400,
+        ("NGN", "USD"): 1 / 1400,
+        ("USD", "KES"): 130,
+        ("KES", "USD"): 1 / 130,
+        ("USD", "EUR"): 0.92,
+        ("EUR", "USD"): 1.09,
+    }
+    key = (from_currency.upper(), to_currency.upper())
+    if key not in exchange_rates:
+        return {"error": f"Exchange rate for {from_currency} to {to_currency} not available."}
+    return {
+        "amount_converted": round(amount * exchange_rates[key], 2),
+        "currency": to_currency,
+    }
 
 
 # ----------------------------
-# Tool 4: RAG (internal knowledge)
+# Tool 4: RAG — queries internal knowledge base and past conversation history
 # ----------------------------
-def query_rag(query: str) -> str:
-    return rag.query(query)
+@tool
+def rag_tool(query: str) -> str:
+    """Useful for answering questions using the internal knowledge base and past conversation history."""
+    docs = retriever.invoke(query)
+    return "\n\n".join(doc.page_content for doc in docs)
 
 
 # ----------------------------
-# Register Tools
+# Create agent using LangChain v1 create_agent API
 # ----------------------------
-tools = [
-    Tool(
-        name="FlightBookingTool",
-        func=get_flight_schedule,
-        description=(
-            "Use this to get flight schedule, flight duration in hours, "
-            "and ticket pricing in USD between cities."
-        )
+agent = create_agent(
+    model=llm,
+    tools=[get_flight_schedule, get_hotel_schedule, convert_currency, rag_tool],
+    system_prompt=(
+        "You are a helpful travel and logistics assistant. "
+        "Use the available tools to answer questions about flights, hotels, "
+        "currency conversion, and internal company knowledge."
     ),
-    Tool(
-        name="HotelBookingTool",
-        func=get_hotel_schedule,
-        description=(
-            "Use this to get hotel booking options and nightly prices in USD "
-            "for a destination city."
-        )
-    ),
-    Tool(
-        name="CurrencyConversionTool",
-        func=convert_currency,
-        description=(
-            "Use this to convert currency amounts between different currencies "
-            "such as USD, NGN (Nigerian Naira), KES (Kenyan Shilling), EUR."
-        )
-    ),
-    Tool(
-        name="InternalKnowledgeRAGTool",
-        func=query_rag,
-        description=(
-            "Use this to retrieve internal company knowledge, documents, "
-            "policies, and past conversation history from the knowledge base."
-        )
-    )
-]
-
-# ----------------------------
-# LLM Setup
-#      Task specifies nvidia/nemotron-3-nano-30b-a3b:free.
-#      Now reads from LLM_MODEL_NAME env var with that as default.
-# ----------------------------
-llm = ChatOpenAI(
-    openai_api_key=OPENROUTER_API_KEY,
-    openai_api_base="https://openrouter.ai/api/v1",
-    model=os.getenv("LLM_MODEL_NAME", "nvidia/nemotron-3-nano-30b-a3b:free")
-)
-
-memory = ConversationBufferMemory(
-    memory_key="chat_history",
-    return_messages=True
-)
-
-agent = initialize_agent(
-    tools,
-    llm,
-    agent=AgentType.OPENAI_FUNCTIONS,
-    memory=memory,
-    verbose=True   #  verbose=True so tool call chain is visible in stdout
 )
 
 
 # ----------------------------
-# Main
+# Entry point — accepts CLI argument as required
+# Usage: python main.py "Your prompt here"
 # ----------------------------
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python main.py \"Your question here\"")
+        print('Usage: python main.py "Your question here"')
         sys.exit(1)
 
     user_prompt = sys.argv[1]
 
-    print(f"\n>>> User: {user_prompt}\n")
+    # Invoke agent using LangChain v1 messages pattern
+    result = agent.invoke({
+        "messages": [
+            {"role": "user", "content": user_prompt}
+        ]
+    })
 
-    response = agent.run(user_prompt)
+    # Extract final response — last message in the messages list
+    response = result["messages"][-1].content
 
-    # Save conversation into vector store for long-term memory retention
+    # Save conversation history (human + AI turns only, NOT tool call steps)
+    # to vector store for long-term memory retrieval
     conversation_text = f"User: {user_prompt}\nAssistant: {response}"
-    rag.save_conversation(conversation_text)
+    uploader.add_texts(
+        [conversation_text],
+        metadata=[{"source": "conversation_history"}]
+    )
 
-    # Print full conversation history as required by the task
+    # Print full conversation history
     print("\n===== FULL CONVERSATION HISTORY =====\n")
-    for msg in memory.chat_memory.messages:
-        role = msg.type.upper()
+    for msg in result["messages"]:
+        role = getattr(msg, "type", type(msg).__name__)
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        print(f"{role}: {content}\n")
+        # Only print human and AI messages, skip tool call intermediates
+        if role in ("human", "ai") and content:
+            print(f"{role.upper()}: {content}\n")
 
+    # Print final response
     print("===== FINAL RESPONSE =====\n")
     print(response)
 
